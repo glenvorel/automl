@@ -22,19 +22,17 @@ import coco_metric
 import dataloader
 import hparams_config
 import utils
-
 from keras import anchors
 from keras import efficientdet_keras
 from keras import label_util
 from keras import postprocess
-from keras import wbf
+from keras import util_keras
 
 # Cloud TPU Cluster Resolvers
 flags.DEFINE_string('tpu', None, 'The Cloud TPU name.')
 flags.DEFINE_string('gcp_project', None, 'Project name.')
 flags.DEFINE_string('tpu_zone', None, 'GCE zone name.')
 
-flags.DEFINE_enum('strategy', None, ['tpu', 'gpus', ''], 'Device strategy.')
 flags.DEFINE_integer('eval_samples', None, 'Number of eval samples.')
 flags.DEFINE_string('val_file_pattern', None,
                     'Glob for eval tfrecords, e.g. coco/val-*.tfrecord.')
@@ -42,7 +40,7 @@ flags.DEFINE_string('val_json_file', None,
                     'Groudtruth, e.g. annotations/instances_val2017.json.')
 flags.DEFINE_string('model_name', 'efficientdet-d0', 'Model name to use.')
 flags.DEFINE_string('model_dir', None, 'Location of the checkpoint to run.')
-flags.DEFINE_integer('batch_size', 8, 'Batch size.')
+flags.DEFINE_integer('batch_size', 8, 'GLobal batch size.')
 flags.DEFINE_string('hparams', '', 'Comma separated k=v pairs or a yaml file')
 FLAGS = flags.FLAGS
 
@@ -50,20 +48,19 @@ FLAGS = flags.FLAGS
 def main(_):
   config = hparams_config.get_efficientdet_config(FLAGS.model_name)
   config.override(FLAGS.hparams)
-  config.batch_size = FLAGS.batch_size
   config.val_json_file = FLAGS.val_json_file
   config.nms_configs.max_nms_inputs = anchors.MAX_DETECTION_POINTS
   config.drop_remainder = False  # eval all examples w/o drop.
   config.image_size = utils.parse_image_size(config['image_size'])
 
-  if FLAGS.strategy == 'tpu':
+  if config.strategy == 'tpu':
     tpu_cluster_resolver = tf.distribute.cluster_resolver.TPUClusterResolver(
         FLAGS.tpu, zone=FLAGS.tpu_zone, project=FLAGS.gcp_project)
     tf.config.experimental_connect_to_cluster(tpu_cluster_resolver)
     tf.tpu.experimental.initialize_tpu_system(tpu_cluster_resolver)
     ds_strategy = tf.distribute.TPUStrategy(tpu_cluster_resolver)
     logging.info('All devices: %s', tf.config.list_logical_devices('TPU'))
-  elif FLAGS.strategy == 'gpus':
+  elif config.strategy == 'gpus':
     ds_strategy = tf.distribute.MirroredStrategy()
     logging.info('All devices: %s', tf.config.list_physical_devices('GPU'))
   else:
@@ -75,38 +72,44 @@ def main(_):
   with ds_strategy.scope():
     # Network
     model = efficientdet_keras.EfficientDetNet(config=config)
-    model.build((config.batch_size, *config.image_size, 3))
-    model.load_weights(tf.train.latest_checkpoint(FLAGS.model_dir))
-
+    model.build((None, *config.image_size, 3))
+    util_keras.restore_ckpt(model,
+                            tf.train.latest_checkpoint(FLAGS.model_dir),
+                            config.moving_average_decay,
+                            skip_mismatch=False)
     @tf.function
-    def f(images, labels):
+    def model_fn(images, labels):
       cls_outputs, box_outputs = model(images, training=False)
-      return postprocess.generate_detections(config, cls_outputs, box_outputs,
-                                             labels['image_scales'],
-                                             labels['source_ids'])
+      detections = postprocess.generate_detections(config,
+                                                   cls_outputs,
+                                                   box_outputs,
+                                                   labels['image_scales'],
+                                                   labels['source_ids'])
+      tf.numpy_function(evaluator.update_state,
+                        [labels['groundtruth_data'],
+                         postprocess.transform_detections(detections)], [])
 
-    # dataset
-    ds = dataloader.InputReader(
-        FLAGS.val_file_pattern,
-        is_training=False,
-        max_instances_per_image=config.max_instances_per_image)(
-            config)
-    if FLAGS.eval_samples:
-      ds = ds.take(FLAGS.eval_samples // config.batch_size)
-
-    # create a evaluator for AP calculation.
+    # Evaluator for AP calculation.
     label_map = label_util.get_label_map(config.label_map)
     evaluator = coco_metric.EvaluationMetric(
         filename=config.val_json_file, label_map=label_map)
 
+    # dataset
+    batch_size = FLAGS.batch_size   # global batch size.
+    ds = dataloader.InputReader(
+        FLAGS.val_file_pattern,
+        is_training=False,
+        max_instances_per_image=config.max_instances_per_image)(
+            config, batch_size=batch_size)
+    if FLAGS.eval_samples:
+      ds = ds.take((FLAGS.eval_samples + batch_size - 1) // batch_size)
+    ds = ds_strategy.experimental_distribute_dataset(ds)
+
     # evaluate all images.
     eval_samples = FLAGS.eval_samples or 5000
-    pbar = tf.keras.utils.Progbar(eval_samples // config.batch_size)
+    pbar = tf.keras.utils.Progbar((eval_samples + batch_size - 1) // batch_size)
     for i, (images, labels) in enumerate(ds):
-      detections = f(images, labels)
-      evaluator.update_state(
-          labels['groundtruth_data'].numpy(),
-          postprocess.transform_detections(detections).numpy())
+      ds_strategy.run(model_fn, (images, labels))
       pbar.update(i)
 
   # compute the final eval results.
@@ -125,5 +128,5 @@ def main(_):
 if __name__ == '__main__':
   flags.mark_flag_as_required('val_file_pattern')
   flags.mark_flag_as_required('model_dir')
-  logging.set_verbosity(logging.WARNING)
+  logging.set_verbosity(logging.ERROR)
   app.run(main)

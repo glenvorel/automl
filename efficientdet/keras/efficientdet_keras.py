@@ -25,8 +25,19 @@ from backbone import backbone_factory
 from backbone import efficientnet_builder
 from keras import fpn_configs
 from keras import postprocess
+from keras import tfmot
 from keras import util_keras
-# pylint: disable=arguments-differ  # fo keras layers.
+
+
+def add_n(nodes):
+  """A customized add_n to add up a list of tensors."""
+  # tf.add_n is not supported by EdgeTPU, while tf.reduce_sum is not supported
+  # by GPU and runs slow on EdgeTPU because of the 5-dimension op.
+  with tf.name_scope('add_n'):
+    new_node = nodes[0]
+    for n in nodes[1:]:
+      new_node = new_node + n
+    return new_node
 
 
 class FNode(tf.keras.layers.Layer):
@@ -45,6 +56,7 @@ class FNode(tf.keras.layers.Layer):
                strategy,
                weight_method,
                data_format,
+               model_optimizations,
                name='fnode'):
     super().__init__(name=name)
     self.feat_level = feat_level
@@ -61,6 +73,7 @@ class FNode(tf.keras.layers.Layer):
     self.conv_bn_act_pattern = conv_bn_act_pattern
     self.resample_layers = []
     self.vars = []
+    self.model_optimizations = model_optimizations
 
   def fuse_features(self, nodes):
     """Fuse features from different resolutions and return a weighted sum.
@@ -74,55 +87,47 @@ class FNode(tf.keras.layers.Layer):
     dtype = nodes[0].dtype
 
     if self.weight_method == 'attn':
-      edge_weights = []
-      for var in self.vars:
-        var = tf.cast(var, dtype=dtype)
-        edge_weights.append(var)
+      edge_weights = [tf.cast(var, dtype=dtype) for var in self.vars]
       normalized_weights = tf.nn.softmax(tf.stack(edge_weights))
       nodes = tf.stack(nodes, axis=-1)
       new_node = tf.reduce_sum(nodes * normalized_weights, -1)
     elif self.weight_method == 'fastattn':
-      edge_weights = []
-      for var in self.vars:
-        var = tf.cast(var, dtype=dtype)
-        edge_weights.append(var)
-      weights_sum = tf.add_n(edge_weights)
+      edge_weights = [
+          tf.nn.relu(tf.cast(var, dtype=dtype)) for var in self.vars
+      ]
+      weights_sum = add_n(edge_weights)
       nodes = [
           nodes[i] * edge_weights[i] / (weights_sum + 0.0001)
           for i in range(len(nodes))
       ]
-      new_node = tf.add_n(nodes)
+      new_node = add_n(nodes)
     elif self.weight_method == 'channel_attn':
-      edge_weights = []
-      for var in self.vars:
-        var = tf.cast(var, dtype=dtype)
-        edge_weights.append(var)
+      edge_weights = [tf.cast(var, dtype=dtype) for var in self.vars]
       normalized_weights = tf.nn.softmax(tf.stack(edge_weights, -1), axis=-1)
       nodes = tf.stack(nodes, axis=-1)
       new_node = tf.reduce_sum(nodes * normalized_weights, -1)
     elif self.weight_method == 'channel_fastattn':
-      edge_weights = []
-      for var in self.vars:
-        var = tf.cast(var, dtype=dtype)
-        edge_weights.append(var)
-
-      weights_sum = tf.add_n(edge_weights)
+      edge_weights = [
+          tf.nn.relu(tf.cast(var, dtype=dtype)) for var in self.vars
+      ]
+      weights_sum = add_n(edge_weights)
       nodes = [
           nodes[i] * edge_weights[i] / (weights_sum + 0.0001)
           for i in range(len(nodes))
       ]
-      new_node = tf.add_n(nodes)
+      new_node = add_n(nodes)
     elif self.weight_method == 'sum':
-      new_node = tf.add_n(nodes)
+      new_node = add_n(nodes)
     else:
       raise ValueError('unknown weight_method %s' % self.weight_method)
 
     return new_node
 
-  def _add_wsm(self, initializer):
+  def _add_wsm(self, initializer, shape=None):
     for i, _ in enumerate(self.inputs_offsets):
       name = 'WSM' + ('' if i == 0 else '_' + str(i))
-      self.vars.append(self.add_weight(initializer=initializer, name=name))
+      self.vars.append(
+          self.add_weight(initializer=initializer, name=name, shape=shape))
 
   def build(self, feats_shape):
     for i, input_offset in enumerate(self.inputs_offsets):
@@ -136,6 +141,7 @@ class FNode(tf.keras.layers.Layer):
               self.conv_after_downsample,
               strategy=self.strategy,
               data_format=self.data_format,
+              model_optimizations=self.model_optimizations,
               name=name))
     if self.weight_method == 'attn':
       self._add_wsm('ones')
@@ -143,10 +149,10 @@ class FNode(tf.keras.layers.Layer):
       self._add_wsm('ones')
     elif self.weight_method == 'channel_attn':
       num_filters = int(self.fpn_num_filters)
-      self._add_wsm(lambda: tf.ones([num_filters]))
+      self._add_wsm(tf.ones, num_filters)
     elif self.weight_method == 'channel_fastattn':
       num_filters = int(self.fpn_num_filters)
-      self._add_wsm(lambda: tf.ones([num_filters]))
+      self._add_wsm(tf.ones, num_filters)
     self.op_after_combine = OpAfterCombine(
         self.is_training_bn,
         self.conv_bn_act_pattern,
@@ -155,6 +161,7 @@ class FNode(tf.keras.layers.Layer):
         self.act_type,
         self.data_format,
         self.strategy,
+        self.model_optimizations,
         name='op_after_combine{}'.format(len(feats_shape)))
     self.built = True
     super().build(feats_shape)
@@ -181,6 +188,7 @@ class OpAfterCombine(tf.keras.layers.Layer):
                act_type,
                data_format,
                strategy,
+               model_optimizations,
                name='op_after_combine'):
     super().__init__(name=name)
     self.conv_bn_act_pattern = conv_bn_act_pattern
@@ -203,6 +211,10 @@ class OpAfterCombine(tf.keras.layers.Layer):
         use_bias=not self.conv_bn_act_pattern,
         data_format=self.data_format,
         name='conv')
+    if model_optimizations:
+      for method in model_optimizations.keys():
+        self.conv_op = (
+            tfmot.get_method(method)(self.conv_op))
     self.bn = util_keras.build_batch_norm(
         is_training_bn=self.is_training_bn,
         data_format=self.data_format,
@@ -232,6 +244,7 @@ class ResampleFeatureMap(tf.keras.layers.Layer):
                data_format=None,
                pooling_type=None,
                upsampling_type=None,
+               model_optimizations=None,
                name='resample_p0'):
     super().__init__(name=name)
     self.apply_bn = apply_bn
@@ -249,6 +262,9 @@ class ResampleFeatureMap(tf.keras.layers.Layer):
         padding='same',
         data_format=self.data_format,
         name='conv2d')
+    if model_optimizations:
+      for method in model_optimizations.keys():
+        self.conv2d = tfmot.get_method(method)(self.conv2d)
     self.bn = util_keras.build_batch_norm(
         is_training_bn=self.is_training_bn,
         data_format=self.data_format,
@@ -265,20 +281,19 @@ class ResampleFeatureMap(tf.keras.layers.Layer):
           strides=[height_stride_size, width_stride_size],
           padding='SAME',
           data_format=self.data_format)(inputs)
-    elif self.pooling_type == 'avg':
+    if self.pooling_type == 'avg':
       return tf.keras.layers.AveragePooling2D(
           pool_size=[height_stride_size + 1, width_stride_size + 1],
           strides=[height_stride_size, width_stride_size],
           padding='SAME',
           data_format=self.data_format)(inputs)
-    else:
-      raise ValueError('Unsupported pooling type {}.'.format(self.pooling_type))
+    raise ValueError('Unsupported pooling type {}.'.format(self.pooling_type))
 
   def _upsample2d(self, inputs, target_height, target_width):
     return tf.cast(
-        tf.image.resize(
-            tf.cast(inputs, tf.float32), [target_height, target_width],
-            method=self.upsampling_type), inputs.dtype)
+        tf.compat.v1.image.resize_nearest_neighbor(
+            tf.cast(inputs, tf.float32), [target_height, target_width]),
+        inputs.dtype)
 
   def _maybe_apply_1x1(self, feat, training, num_channels):
     """Apply 1x1 conv to change layer width if necessary."""
@@ -334,7 +349,9 @@ class ClassNet(tf.keras.layers.Layer):
                survival_prob=None,
                strategy=None,
                data_format='channels_last',
+               grad_checkpoint=False,
                name='class_net',
+               feature_only=False,
                **kwargs):
     """Initialize the ClassNet.
 
@@ -351,7 +368,10 @@ class ClassNet(tf.keras.layers.Layer):
       survival_prob: if a value is set then drop connect will be used.
       strategy: string to specify training strategy for TPU/GPU/CPU.
       data_format: string of 'channel_first' or 'channels_last'.
+      grad_checkpoint: bool, If true, apply grad checkpoint for saving memory.
       name: the name of this layerl.
+      feature_only: build the base feature network only (excluding final class
+        head).
       **kwargs: other parameters.
     """
 
@@ -370,18 +390,10 @@ class ClassNet(tf.keras.layers.Layer):
     self.data_format = data_format
     self.conv_ops = []
     self.bns = []
-    if separable_conv:
-      conv2d_layer = functools.partial(
-          tf.keras.layers.SeparableConv2D,
-          depth_multiplier=1,
-          data_format=data_format,
-          pointwise_initializer=tf.initializers.VarianceScaling(),
-          depthwise_initializer=tf.initializers.VarianceScaling())
-    else:
-      conv2d_layer = functools.partial(
-          tf.keras.layers.Conv2D,
-          data_format=data_format,
-          kernel_initializer=tf.random_normal_initializer(stddev=0.01))
+    self.grad_checkpoint = grad_checkpoint
+    self.feature_only = feature_only
+
+    conv2d_layer = self.conv2d_layer(separable_conv, data_format)
     for i in range(self.repeats):
       # If using SeparableConv2D
       self.conv_ops.append(
@@ -404,32 +416,69 @@ class ClassNet(tf.keras.layers.Layer):
             ))
       self.bns.append(bn_per_level)
 
-    self.classes = conv2d_layer(
-        num_classes * num_anchors,
-        kernel_size=3,
-        bias_initializer=tf.constant_initializer(-np.log((1 - 0.01) / 0.01)),
-        padding='same',
-        name='class-predict')
+    self.classes = self.classes_layer(
+        conv2d_layer, num_classes, num_anchors, name='class-predict')
+
+  @tf.autograph.experimental.do_not_convert
+  def _conv_bn_act(self, image, i, level_id, training):
+    conv_op = self.conv_ops[i]
+    bn = self.bns[i][level_id]
+    act_type = self.act_type
+
+    @utils.recompute_grad(self.grad_checkpoint)
+    def _call(image):
+      original_image = image
+      image = conv_op(image)
+      image = bn(image, training=training)
+      if self.act_type:
+        image = utils.activation_fn(image, act_type)
+      if i > 0 and self.survival_prob:
+        image = utils.drop_connect(image, training, self.survival_prob)
+        image = image + original_image
+      return image
+
+    return _call(image)
 
   def call(self, inputs, training, **kwargs):
     """Call ClassNet."""
-
     class_outputs = []
     for level_id in range(0, self.max_level - self.min_level + 1):
       image = inputs[level_id]
       for i in range(self.repeats):
-        original_image = image
-        image = self.conv_ops[i](image)
-        image = self.bns[i][level_id](image, training=training)
-        if self.act_type:
-          image = utils.activation_fn(image, self.act_type)
-        if i > 0 and self.survival_prob:
-          image = utils.drop_connect(image, training, self.survival_prob)
-          image = image + original_image
-
-      class_outputs.append(self.classes(image))
+        image = self._conv_bn_act(image, i, level_id, training)
+      if self.feature_only:
+        class_outputs.append(image)
+      else:
+        class_outputs.append(self.classes(image))
 
     return class_outputs
+
+  @classmethod
+  def conv2d_layer(cls, separable_conv, data_format):
+    """Gets the conv2d layer in ClassNet class."""
+    if separable_conv:
+      conv2d_layer = functools.partial(
+          tf.keras.layers.SeparableConv2D,
+          depth_multiplier=1,
+          data_format=data_format,
+          pointwise_initializer=tf.initializers.variance_scaling(),
+          depthwise_initializer=tf.initializers.variance_scaling())
+    else:
+      conv2d_layer = functools.partial(
+          tf.keras.layers.Conv2D,
+          data_format=data_format,
+          kernel_initializer=tf.random_normal_initializer(stddev=0.01))
+    return conv2d_layer
+
+  @classmethod
+  def classes_layer(cls, conv2d_layer, num_classes, num_anchors, name):
+    """Gets the classes layer in ClassNet class."""
+    return conv2d_layer(
+        num_classes * num_anchors,
+        kernel_size=3,
+        bias_initializer=tf.constant_initializer(-np.log((1 - 0.01) / 0.01)),
+        padding='same',
+        name=name)
 
 
 class BoxNet(tf.keras.layers.Layer):
@@ -447,7 +496,9 @@ class BoxNet(tf.keras.layers.Layer):
                survival_prob=None,
                strategy=None,
                data_format='channels_last',
+               grad_checkpoint=False,
                name='box_net',
+               feature_only=False,
                **kwargs):
     """Initialize BoxNet.
 
@@ -463,7 +514,10 @@ class BoxNet(tf.keras.layers.Layer):
       survival_prob: if a value is set then drop connect will be used.
       strategy: string to specify training strategy for TPU/GPU/CPU.
       data_format: string of 'channel_first' or 'channels_last'.
+      grad_checkpoint: bool, If true, apply grad checkpoint for saving memory.
       name: Name of the layer.
+      feature_only: build the base feature network only (excluding box class
+        head).
       **kwargs: other parameters.
     """
 
@@ -480,6 +534,8 @@ class BoxNet(tf.keras.layers.Layer):
     self.act_type = act_type
     self.strategy = strategy
     self.data_format = data_format
+    self.grad_checkpoint = grad_checkpoint
+    self.feature_only = feature_only
 
     self.conv_ops = []
     self.bns = []
@@ -491,8 +547,8 @@ class BoxNet(tf.keras.layers.Layer):
             tf.keras.layers.SeparableConv2D(
                 filters=self.num_filters,
                 depth_multiplier=1,
-                pointwise_initializer=tf.initializers.VarianceScaling(),
-                depthwise_initializer=tf.initializers.VarianceScaling(),
+                pointwise_initializer=tf.initializers.variance_scaling(),
+                depthwise_initializer=tf.initializers.variance_scaling(),
                 data_format=self.data_format,
                 kernel_size=3,
                 activation=None,
@@ -522,28 +578,28 @@ class BoxNet(tf.keras.layers.Layer):
                 name='box-%d-bn-%d' % (i, level)))
       self.bns.append(bn_per_level)
 
-    if self.separable_conv:
-      self.boxes = tf.keras.layers.SeparableConv2D(
-          filters=4 * self.num_anchors,
-          depth_multiplier=1,
-          pointwise_initializer=tf.initializers.VarianceScaling(),
-          depthwise_initializer=tf.initializers.VarianceScaling(),
-          data_format=self.data_format,
-          kernel_size=3,
-          activation=None,
-          bias_initializer=tf.zeros_initializer(),
-          padding='same',
-          name='box-predict')
-    else:
-      self.boxes = tf.keras.layers.Conv2D(
-          filters=4 * self.num_anchors,
-          kernel_initializer=tf.random_normal_initializer(stddev=0.01),
-          data_format=self.data_format,
-          kernel_size=3,
-          activation=None,
-          bias_initializer=tf.zeros_initializer(),
-          padding='same',
-          name='box-predict')
+      self.boxes = self.boxes_layer(
+          separable_conv, num_anchors, data_format, name='box-predict')
+
+  @tf.autograph.experimental.do_not_convert
+  def _conv_bn_act(self, image, i, level_id, training):
+    conv_op = self.conv_ops[i]
+    bn = self.bns[i][level_id]
+    act_type = self.act_type
+
+    @utils.recompute_grad(self.grad_checkpoint)
+    def _call(image):
+      original_image = image
+      image = conv_op(image)
+      image = bn(image, training=training)
+      if self.act_type:
+        image = utils.activation_fn(image, act_type)
+      if i > 0 and self.survival_prob:
+        image = utils.drop_connect(image, training, self.survival_prob)
+        image = image + original_image
+      return image
+
+    return _call(image)
 
   def call(self, inputs, training):
     """Call boxnet."""
@@ -551,18 +607,40 @@ class BoxNet(tf.keras.layers.Layer):
     for level_id in range(0, self.max_level - self.min_level + 1):
       image = inputs[level_id]
       for i in range(self.repeats):
-        original_image = image
-        image = self.conv_ops[i](image)
-        image = self.bns[i][level_id](image, training=training)
-        if self.act_type:
-          image = utils.activation_fn(image, self.act_type)
-        if i > 0 and self.survival_prob:
-          image = utils.drop_connect(image, training, self.survival_prob)
-          image = image + original_image
+        image = self._conv_bn_act(image, i, level_id, training)
 
-      box_outputs.append(self.boxes(image))
+      if self.feature_only:
+        box_outputs.append(image)
+      else:
+        box_outputs.append(self.boxes(image))
 
     return box_outputs
+
+  @classmethod
+  def boxes_layer(cls, separable_conv, num_anchors, data_format, name):
+    """Gets the conv2d layer in BoxNet class."""
+    if separable_conv:
+      return tf.keras.layers.SeparableConv2D(
+          filters=4 * num_anchors,
+          depth_multiplier=1,
+          pointwise_initializer=tf.initializers.variance_scaling(),
+          depthwise_initializer=tf.initializers.variance_scaling(),
+          data_format=data_format,
+          kernel_size=3,
+          activation=None,
+          bias_initializer=tf.zeros_initializer(),
+          padding='same',
+          name=name)
+    else:
+      return tf.keras.layers.Conv2D(
+          filters=4 * num_anchors,
+          kernel_initializer=tf.random_normal_initializer(stddev=0.01),
+          data_format=data_format,
+          kernel_size=3,
+          activation=None,
+          bias_initializer=tf.zeros_initializer(),
+          padding='same',
+          name=name)
 
 
 class SegmentationHead(tf.keras.layers.Layer):
@@ -693,19 +771,27 @@ class FPNCell(tf.keras.layers.Layer):
           strategy=config.strategy,
           weight_method=self.fpn_config.weight_method,
           data_format=config.data_format,
+          model_optimizations=config.model_optimizations,
           name='fnode%d' % i)
       self.fnodes.append(fnode)
 
   def call(self, feats, training):
-    for fnode in self.fnodes:
-      feats = fnode(feats, training)
-    return feats
+    @utils.recompute_grad(self.config.grad_checkpoint)
+    def _call(feats):
+      for fnode in self.fnodes:
+        feats = fnode(feats, training)
+      return feats
+    return _call(feats)
 
 
 class EfficientDetNet(tf.keras.Model):
   """EfficientDet keras network without pre/post-processing."""
 
-  def __init__(self, model_name=None, config=None, name=''):
+  def __init__(self,
+               model_name=None,
+               config=None,
+               name='',
+               feature_only=False):
     """Initialize model."""
     super().__init__(name=name)
 
@@ -721,6 +807,7 @@ class EfficientDetNet(tf.keras.Model):
               utils.batch_norm_class(is_training_bn, config.strategy),
           'relu_fn':
               functools.partial(utils.activation_fn, act_type=config.act_type),
+          'grad_checkpoint': self.config.grad_checkpoint
       }
       if 'b0' in backbone_name:
         override_params['survival_prob'] = 0.0
@@ -745,6 +832,7 @@ class EfficientDetNet(tf.keras.Model):
               conv_after_downsample=config.conv_after_downsample,
               strategy=config.strategy,
               data_format=config.data_format,
+              model_optimizations=config.model_optimizations,
               name='resample_p%d' % level,
           ))
     self.fpn_cells = FPNCells(config)
@@ -766,7 +854,9 @@ class EfficientDetNet(tf.keras.Model):
             separable_conv=config.separable_conv,
             survival_prob=config.survival_prob,
             strategy=config.strategy,
-            data_format=config.data_format)
+            grad_checkpoint=config.grad_checkpoint,
+            data_format=config.data_format,
+            feature_only=feature_only)
 
         self.box_net = BoxNet(
             num_anchors=num_anchors,
@@ -779,7 +869,9 @@ class EfficientDetNet(tf.keras.Model):
             separable_conv=config.separable_conv,
             survival_prob=config.survival_prob,
             strategy=config.strategy,
-            data_format=config.data_format)
+            grad_checkpoint=config.grad_checkpoint,
+            data_format=config.data_format,
+            feature_only=feature_only)
 
       if head == 'segmentation':
         self.seg_head = SegmentationHead(
@@ -827,7 +919,12 @@ class EfficientDetNet(tf.keras.Model):
 class EfficientDetModel(EfficientDetNet):
   """EfficientDet full keras model with pre and post processing."""
 
-  def _preprocessing(self, raw_images, image_size, mode=None):
+  def _preprocessing(self,
+                     raw_images,
+                     image_size,
+                     mean_rgb,
+                     stddev_rgb,
+                     mode=None):
     """Preprocess images before feeding to the network."""
     if not mode:
       return raw_images, None
@@ -840,7 +937,7 @@ class EfficientDetModel(EfficientDetNet):
     def map_fn(image):
       input_processor = dataloader.DetectionInputProcessor(
           image, image_size)
-      input_processor.normalize_image()
+      input_processor.normalize_image(mean_rgb, stddev_rgb)
       input_processor.set_scale_factors_to_output_size()
       image = input_processor.resize_and_crop_image()
       image_scale = input_processor.image_scale_to_original
@@ -869,6 +966,12 @@ class EfficientDetModel(EfficientDetNet):
     if mode == 'per_class':
       return postprocess.postprocess_per_class(self.config.as_dict(),
                                                cls_outputs, box_outputs, scales)
+    if mode == 'tflite':
+      if scales is not None:
+        # pre_mode should be None for TFLite.
+        raise ValueError('scales not supported for TFLite post-processing')
+      return postprocess.postprocess_tflite(self.config.as_dict(), cls_outputs,
+                                            box_outputs)
     raise ValueError('Unsupported postprocess mode {}'.format(mode))
 
   def call(self, inputs, training=False, pre_mode='infer', post_mode='global'):
@@ -886,7 +989,9 @@ class EfficientDetModel(EfficientDetNet):
     config = self.config
 
     # preprocess.
-    inputs, scales = self._preprocessing(inputs, config.image_size, pre_mode)
+    inputs, scales = self._preprocessing(inputs, config.image_size,
+                                         config.mean_rgb, config.stddev_rgb,
+                                         pre_mode)
     # network.
     outputs = super().call(inputs, training)
 

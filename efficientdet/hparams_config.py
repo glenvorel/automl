@@ -50,6 +50,9 @@ class Config(object):
   def __repr__(self):
     return repr(self.as_dict())
 
+  def __deepcopy__(self, memodict):
+    return type(self)(self.as_dict())
+
   def __str__(self):
     try:
       return yaml.dump(self.as_dict(), indent=4)
@@ -181,10 +184,9 @@ def default_detection_configs():
   h.jitter_min = 0.1
   h.jitter_max = 2.0
   h.autoaugment_policy = None
-  h.use_augmix = False
-  # mixture_width, mixture_depth, alpha
-  h.augmix_params = [3, -1, 1]
+  h.grid_mask = False
   h.sample_image = None
+  h.map_freq = 5  # AP eval frequency in epochs.
 
   # dataset specific parameters
   # TODO(tanmingxing): update this to be 91 for COCO, and 21 for pascal.
@@ -202,7 +204,7 @@ def default_detection_configs():
   h.max_level = 7
   h.num_scales = 3
   # ratio w/h: 2.0 means w=1.4, h=0.7. Can be computed with k-mean per dataset.
-  h.aspect_ratios = [1.0, 2.0, 0.5]
+  h.aspect_ratios = [1.0, 2.0, 0.5]  # [[0.7, 1.4], [1.0, 1.0], [1.4, 0.7]]
   h.anchor_scale = 4.0
   # is batchnorm training mode
   h.is_training_bn = True
@@ -218,6 +220,9 @@ def default_detection_configs():
   h.clip_gradients_norm = 10.0
   h.num_epochs = 300
   h.data_format = 'channels_last'
+  # The default image normalization is identical to Cloud TPU ResNet.
+  h.mean_rgb = [0.485 * 255, 0.456 * 255, 0.406 * 255]
+  h.stddev_rgb = [0.229 * 255, 0.224 * 255, 0.225 * 255]
 
   # classification loss
   h.label_smoothing = 0.0  # 0.1 is a good default
@@ -236,6 +241,8 @@ def default_detection_configs():
   h.weight_decay = 4e-5
   h.strategy = None  # 'tpu', 'gpus', None
   h.mixed_precision = False  # If False, use float32.
+  h.loss_scale = None  # set to 2**16 enables dynamic loss scale
+  h.model_optimizations = {}  # 'prune':{}
 
   # For detection.
   h.box_class_repeats = 3
@@ -251,11 +258,13 @@ def default_detection_configs():
   h.nms_configs = {
       'method': 'gaussian',
       'iou_thresh': None,  # use the default value based on method.
-      'score_thresh': None,
+      'score_thresh': 0.,
       'sigma': None,
+      'pyfunc': False,
       'max_nms_inputs': 0,
       'max_output_size': 100,
   }
+  h.tflite_max_detections = 100
 
   # version.
   h.fpn_name = None
@@ -280,30 +289,7 @@ def default_detection_configs():
   h.use_keras_model = True
   h.dataset_type = None
   h.positives_momentum = None
-
-  # Reduces memory during training
-  h.gradient_checkpointing = False
-
-  # Values that could be used are "Add", "Mul", "Conv2d", "Floor", "Sigmoid",
-  # and other ops names
-  # or more specific, e.g. "blocks_10/se/conv2d_1"
-  # E.g. if you use ["Add", "Sigmoid"] it would automatically checkpoint
-  # all "Add" and "Sigmoid" ops
-  # The advantage of adding more ops is that the GPU does not need to recompute
-  # them during the backward pass and can use them as a base to recompute
-  # other nodes, so it improves the speed
-  # The disadvantage of adding more ops is it requires more GPU memory to cache
-  # the computation
-  # The default is ["Add"] as it is a "bottleneck" node in the backbone network
-  # EfficientNet. It has been tested and works reasonably well:
-  # 1) For d4 network with batch-size of 1 (mixed precision enabled) it takes
-  # only 1/3.2 of memory with roughly 32% slower computation.
-  # 2) It allows to train a d6 network with batch size of 2 and mixed precision
-  # on a 11Gb (2080ti) GPU, without this option there is an OOM error
-  h.gradient_checkpointing_list = ["Add"]
-
-  # enable memory logging for NVIDIA cards
-  h.nvgpu_logging = False
+  h.grad_checkpoint = False
 
   return h
 
@@ -398,57 +384,70 @@ efficientdet_model_param_dict = {
         ),
 }
 
+
+lite_common_param = dict(
+    mean_rgb=127.0,
+    stddev_rgb=128.0,
+    act_type='relu6',
+    fpn_weight_method='sum',
+)
+
 efficientdet_lite_param_dict = {
     # lite models are in progress and subject to changes.
+    # mean_rgb and stddev_rgb are consistent with EfficientNet-Lite models in
+    # https://github.com/tensorflow/tpu/blob/master/models/official/efficientnet/lite/efficientnet_lite_builder.py#L28
     'efficientdet-lite0':
         dict(
             name='efficientdet-lite0',
             backbone_name='efficientnet-lite0',
-            image_size=512,
+            image_size=320,
             fpn_num_filters=64,
             fpn_cell_repeats=3,
             box_class_repeats=3,
-            act_type='relu',
+            anchor_scale=3.0,
+            **lite_common_param,
         ),
     'efficientdet-lite1':
         dict(
             name='efficientdet-lite1',
             backbone_name='efficientnet-lite1',
-            image_size=640,
+            image_size=384,
             fpn_num_filters=88,
             fpn_cell_repeats=4,
             box_class_repeats=3,
-            act_type='relu',
+            anchor_scale=3.0,
+            **lite_common_param,
         ),
     'efficientdet-lite2':
         dict(
             name='efficientdet-lite2',
             backbone_name='efficientnet-lite2',
-            image_size=768,
+            image_size=448,
             fpn_num_filters=112,
             fpn_cell_repeats=5,
             box_class_repeats=3,
-            act_type='relu',
+            anchor_scale=3.0,
+            **lite_common_param,
         ),
     'efficientdet-lite3':
         dict(
             name='efficientdet-lite3',
             backbone_name='efficientnet-lite3',
-            image_size=896,
+            image_size=512,
             fpn_num_filters=160,
             fpn_cell_repeats=6,
             box_class_repeats=4,
-            act_type='relu',
+            **lite_common_param,
         ),
     'efficientdet-lite4':
         dict(
             name='efficientdet-lite4',
             backbone_name='efficientnet-lite4',
-            image_size=1024,
+            image_size=512,
             fpn_num_filters=224,
             fpn_cell_repeats=7,
             box_class_repeats=4,
-            act_type='relu',
+            **lite_common_param,
         ),
 }
 
